@@ -51,7 +51,9 @@ Without this, everything else is still removed and the tool tells you what it co
 
 - Your ChatGPT **account** or chats stored online. To delete those, use ChatGPT's own settings on the web.
 - The OpenAI developer libraries (`openai` for Python or Node), which other projects may use.
-- Other apps that happen to mention OpenAI.
+- Other apps, projects or websites that merely mention OpenAI or Codex. It only stops programs installed by ChatGPT/Codex, and only clears browser data for ChatGPT/OpenAI's own sites.
+
+**Using browser sync?** Safari's iCloud sync is told about the deletions. Chrome Sync and Firefox Sync are not, so if you use them, also clear chatgpt.com history and bookmarks on your other devices, or they may sync back.
 
 ## Is it safe?
 

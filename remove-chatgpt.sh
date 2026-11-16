@@ -33,8 +33,10 @@ spin() {  # spin "label" cmd...  - runs cmd with a spinner
 }
 bar() {  # bar done total
   (( TTY )) || return 0
-  local w=30 d=$(( $1 * 30 / ($2 ? $2 : 1) ))
-  printf '\r  [%s%s] %d/%d' "${G}$(printf '█%.0s' $(seq 1 $d))${N}" "$(printf '░%.0s' $(seq 1 $(( w - d ))))" "$1" "$2"
+  local w=30 d=$(( $1 * 30 / ($2 ? $2 : 1) )) k full= empty=
+  for (( k=0; k<d; k++ )); do full+='█'; done
+  for (( k=d; k<w; k++ )); do empty+='░'; done
+  printf '\r  [%s%s] %d/%d' "${G}${full}${N}" "$empty" "$1" "$2"
   (( $1 == $2 )) && printf '\r\e[K'
   return 0
 }
@@ -44,15 +46,16 @@ echo
 type_out "${B}ChatGPT uninstaller${N} ${DIM}— $( (( DO )) && echo 'removing' || echo 'preview, nothing will be changed')${N}"
 
 # ---- processes ---------------------------------------------------------------------------
-# Patterns chosen so they never match this script's own name.
-PROC='chatgpt\.app|chatgpthelper|openai|/codex'
+# Only programs that live inside ChatGPT/Codex install locations, so a user's own
+# "openai" or "codex" projects are never touched.
+PROC='/ChatGPT[^/]*\.app/|/Codex[^/]*\.app/|ChatGPTHelper|/\.codex/|/\.cache/codex-runtimes/|@openai/codex/|/(opt/homebrew|usr/local)/bin/codex( |$)|/\.(vscode|cursor)/extensions/openai\.'
 # Match the visible command line (pgrep -f also sees hidden original args and over-matches).
-procs() { ps -axo pid=,command= | grep -i -E "$PROC" | grep -v -E 'grep|remove-chatgpt|clear-chatgpt'; }
+procs() { ps -axo pid=,command= | grep -E "$PROC" | grep -v -E 'grep|remove-chatgpt|clear-chatgpt'; }
 
 section "Running ChatGPT processes"
 procs | cut -c1-120 | while read -r line; do item "stop $line"; done
 stop_all() {
-  osascript -e 'quit app "ChatGPT"' >/dev/null 2>&1; sleep 2
+  pgrep -x -q ChatGPT && osascript -e 'quit app "ChatGPT"' >/dev/null 2>&1 && sleep 2
   for sig in TERM KILL; do
     for pid in $(procs | awk '{print $1}'); do kill -$sig "$pid" 2>/dev/null; done; sleep 1
   done
@@ -60,7 +63,7 @@ stop_all() {
 (( DO )) && spin "Stopping ChatGPT" stop_all
 
 # ---- browsers ----------------------------------------------------------------------------
-section "Browser data (history, cookies, logins, site data)"
+section "Browser data (history, cookies, logins, bookmarks, site data, cached pages)"
 if ! "$PY" -c 'import sqlite3' >/dev/null 2>&1; then
   echo "  ${Y}Skipped: needs Python 3 (run: xcode-select --install)${N}"
 elif (( DO )); then
@@ -68,15 +71,6 @@ elif (( DO )); then
 else
   "$PY" "$HERE/clear-chatgpt-browsers.py"
 fi
-
-section "Cached ChatGPT pages in browsers"
-CACHES=(~/Library/Caches/Google/Chrome/*/{Cache,"Code Cache"} ~/Library/Caches/Firefox/Profiles/*/cache2)
-LIST=$(mktemp)
-scan_caches() { grep -l -a -i -E 'chatgpt\.com|openai\.com|oaistatic\.com|oaiusercontent\.com' -r "${CACHES[@]}" >"$LIST" 2>/dev/null; true; }
-(( ${#CACHES[@]} )) && spin "Scanning browser caches" scan_caches
-item "$(grep -c . "$LIST") cached pages"
-if (( DO )) && [[ -s "$LIST" ]] && ! pgrep -x -q "Google Chrome|firefox"; then tr '\n' '\0' <"$LIST" | xargs -0 rm -f; fi
-rm -f "$LIST"
 
 # ---- documents ---------------------------------------------------------------------------
 section "ChatGPT / Codex folders in Documents (moved to Trash, not deleted)"
@@ -114,10 +108,11 @@ for svc in "Codex Safe Storage" "ChatGPT Safe Storage" "ChatGPT" "com.openai.cha
 done
 
 section "Dock"
-"$PY" - ~/Library/Preferences/com.apple.dock.plist "$DO" <<'PY' 2>/dev/null
+"$PY" - "$DO" <<'PY' 2>/dev/null
 import plistlib, re, subprocess, sys
-path, do = sys.argv[1], sys.argv[2] == "1"
-d = plistlib.load(open(path, "rb"))
+do = sys.argv[1] == "1"
+# Read live settings (not the plist file, which can lag behind) so recent Dock changes survive.
+d = plistlib.loads(subprocess.run(["defaults", "export", "com.apple.dock", "-"], capture_output=True, check=True).stdout)
 hit = lambda t: re.search(r"chatgpt|codex|openai", str(t.get("tile-data", {}).get("file-data", {}).get("_CFURLString", "")), re.I)
 gone = [t for k in ("persistent-apps", "recent-apps") for t in d.get(k, []) if hit(t)]
 for t in gone: print("  • remove Dock icon:", t["tile-data"].get("file-label"))
@@ -158,11 +153,11 @@ for p in \
 do
   [[ -e "$p" || -L "$p" ]] && FILES+=("$p") && item "$p"
 done
-if (( DO )); then
+if (( DO && ${#FILES[@]} )); then  # guard: bash 3.2 + set -u fails on empty arrays
   i=0; for p in "${FILES[@]}"; do rm -rf "$p" 2>/dev/null; bar $(( ++i )) ${#FILES[@]}; done
 fi
 
-TMPS=("${TMPDIR%/}"/com.openai.* "${TMPDIR%/}"/.com.openai.*)
+T="${TMPDIR:-/tmp}"; TMPS=("${T%/}"/com.openai.* "${T%/}"/.com.openai.*)
 section "Temp files"
 item "${#TMPS[@]} temp folders"
 (( DO && ${#TMPS[@]} )) && spin "Deleting temp files" rm -rf "${TMPS[@]}"

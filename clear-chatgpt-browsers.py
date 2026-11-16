@@ -1,31 +1,37 @@
 #!/usr/bin/python3
-"""Remove ChatGPT/OpenAI history, cookies, saved logins, bookmarks and site storage
-from Chrome, Firefox and Safari. Needs Full Disk Access; browsers must be quit.
-Usage: clear-chatgpt-browsers.py          -> dry run (counts only)
-       clear-chatgpt-browsers.py --yes    -> quits browsers, backs up, deletes"""
-import glob, json, os, re, shutil, sqlite3, struct, subprocess, sys, time
+"""Remove ChatGPT/OpenAI history, cookies, saved logins, bookmarks, site storage and cached pages
+from Chrome, Firefox and Safari. Needs Full Disk Access for Safari; browsers must be quit.
+Usage: clear-chatgpt-browsers.py          -> preview (counts only)
+       clear-chatgpt-browsers.py --yes    -> quits browsers, backs up, deletes
+       add --safari to touch Safari only"""
+import glob, json, os, re, shutil, sqlite3, struct, subprocess, sys, time, urllib.parse
 
 DO = "--yes" in sys.argv
 HOSTS = ["chatgpt.com", "openai.com", "oaistatic.com", "oaiusercontent.com", "chat.com", "sora.com"]
-RX = re.compile("|".join(re.escape(h) for h in HOSTS), re.I)
 L = os.path.expanduser("~/Library")
 BACKUP = os.path.expanduser(f"~/Library/Application Support/chatgpt-browser-backup-{time.strftime('%Y%m%d-%H%M%S')}")
 
 
-def host_hit(h):  # exact host or subdomain, so "notchat.com" does not match "chat.com"
-    h = (h or "").lower().lstrip(".")
+def host_hit(h):  # exact host or subdomain, so "wechat.com" does not match "chat.com"
+    h = (h or "").lower().strip().lstrip(".")
     return any(h == x or h.endswith("." + x) for x in HOSTS)
 
 
 def url_hit(u):
-    m = re.match(r"^[a-z-]+://([^/:?#]+)", u or "", re.I)
+    m = re.match(r"^[a-z-]+://([^/:?#\s]+)", u or "", re.I)
     return bool(m) and host_hit(m.group(1))
 
 
+def any_url_hit(text):
+    return any(url_hit(u) for u in re.findall(r"https?://[^\s\x00\"'<>]+", text))
+
+
 def db(path):
-    c = sqlite3.connect(path)
-    c.create_function("hit", 1, lambda u: url_hit(u))
-    c.create_function("hhit", 1, lambda h: host_hit(h))
+    # Preview opens read-only and ignores locks, so a running browser can't stall it.
+    uri = "file:" + urllib.parse.quote(path) + ("" if DO else "?immutable=1")
+    c = sqlite3.connect(uri, uri=True)
+    c.create_function("hit", 1, url_hit)
+    c.create_function("hhit", 1, host_hit)
     return c
 
 
@@ -34,6 +40,13 @@ def backup(path):
         dst = BACKUP + path.replace(L, "")
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(path, dst)
+
+
+def write_atomic(path, data):
+    tmp = path + ".tmp-chatgpt-uninstaller"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
 
 
 def run(path, label, count_sql, delete_sqls):
@@ -54,12 +67,86 @@ def run(path, label, count_sql, delete_sqls):
         print(f"  {label}: ERROR {e}")
 
 
-def rm_dirs(paths, label):
+def rm_paths(paths, label):
     paths = [p for p in paths if os.path.exists(p)]
     print(f"  {label}: {len(paths)}")
     for p in paths:
         if DO:
             shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) else os.remove(p)
+
+
+def chrome_origin_hit(name):  # "https_chatgpt.com_0.indexeddb.leveldb" -> chatgpt.com
+    m = re.match(r"^[a-z-]+_([^_]+)_\d+", name)
+    return bool(m) and host_hit(m.group(1))
+
+
+def firefox_origin_hit(name):  # "https+++chatgpt.com^userContextId=1" / "https+++chatgpt.com+443"
+    m = re.match(r"^[a-z-]+\+\+\+([^+^]+)", name)
+    return bool(m) and host_hit(m.group(1))
+
+
+def safari_origin_hit(path):  # the "origin" file stores the site's scheme and host as strings
+    try:
+        raw = open(path, "rb").read().decode("latin-1")
+    except OSError:
+        return False
+    return any(host_hit(t) for t in re.findall(r"[a-z0-9.-]+\.[a-z]{2,}", raw, re.I))
+
+
+def chrome_cache_hit(path):
+    """Chrome 'simple cache' entry: 8-byte magic, version, key length, ... then the key (URLs)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+        if len(head) < 24 or struct.unpack("<Q", head[:8])[0] != 0xFCFB6D1BA7725C30:
+            return False
+        klen = struct.unpack("<I", head[12:16])[0]
+        return any_url_hit(head[24:24 + klen].decode("latin-1"))
+    except OSError:
+        return False
+
+
+def firefox_cache_hit(path):
+    """Firefox cache2 entry: last 4 bytes point to metadata, which starts with the key ':https://...'."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        off = struct.unpack(">I", data[-4:])[0]
+        meta = data[off:off + 8192]
+        i = meta.find(b":http")
+        if i < 0:
+            return False
+        return url_hit(meta[i + 1:meta.find(b"\0", i)].decode("latin-1"))
+    except (OSError, struct.error, ValueError):
+        return False
+
+
+def prune_bookmarks(path):
+    """Remove ChatGPT bookmarks from a Chrome Bookmarks JSON file (also used for Bookmarks.bak)."""
+    try:
+        data = json.load(open(path))
+    except (OSError, ValueError):
+        return 0
+    n = 0
+
+    def prune(node):
+        nonlocal n
+        kids = node.get("children")
+        if kids is not None:
+            keep = [k for k in kids if not (k.get("type") == "url" and url_hit(k.get("url")))]
+            n += len(kids) - len(keep)
+            node["children"] = keep
+            for k in keep:
+                prune(k)
+
+    for root in data.get("roots", {}).values():
+        if isinstance(root, dict):
+            prune(root)
+    if DO and n:
+        backup(path)
+        data.pop("checksum", None)  # Chrome recomputes it
+        write_atomic(path, json.dumps(data, indent=3).encode())
+    return n
 
 
 def chrome():
@@ -76,34 +163,18 @@ def chrome():
             ["delete from logins where hit(origin_url)"])
         run(d + "/Favicons", "favicons", "select count(*) from icon_mapping where hit(page_url)",
             ["delete from icon_mapping where hit(page_url)"])
-        rm_dirs([p for sub in ("IndexedDB", "File System", "databases")
-                 for p in glob.glob(f"{d}/{sub}/*") if RX.search(os.path.basename(p))], "site storage")
-        bm = d + "/Bookmarks"
-        if os.path.exists(bm):
-            data = json.load(open(bm))
-            n = 0
-            def prune(node):
-                nonlocal n
-                kids = node.get("children")
-                if kids is not None:
-                    keep = [k for k in kids if not (k.get("type") == "url" and url_hit(k.get("url")))]
-                    n += len(kids) - len(keep)
-                    node["children"] = keep
-                    for k in keep:
-                        prune(k)
-            for root in data.get("roots", {}).values():
-                if isinstance(root, dict):
-                    prune(root)
-            print(f"  bookmarks: {n}")
-            if DO and n:
-                backup(bm)
-                data.pop("checksum", None)  # Chrome recomputes it
-                json.dump(data, open(bm, "w"), indent=3)
+        rm_paths([p for sub in ("IndexedDB", "databases") for p in glob.glob(f"{d}/{sub}/*")
+                  if chrome_origin_hit(os.path.basename(p))], "site storage")
+        print(f"  bookmarks: {sum(prune_bookmarks(f) for f in (d + '/Bookmarks', d + '/Bookmarks.bak') if os.path.exists(f))}")
+        cache = L + "/Caches/Google/Chrome/" + os.path.basename(d)
+        rm_paths([p for p in glob.glob(cache + "/Cache/Cache_Data/*") + glob.glob(cache + "/Code Cache/*/*")
+                  if chrome_cache_hit(p)], "cached pages")
 
 
 def firefox():
     for prof in glob.glob(L + "/Application Support/Firefox/Profiles/*/"):
-        print(f"Firefox {os.path.basename(prof.rstrip('/'))}")
+        name = os.path.basename(prof.rstrip("/"))
+        print(f"Firefox {name}")
         ids = "(select id from moz_places where hit(url))"
         run(prof + "places.sqlite", "history+bookmarks", "select count(*) from moz_places where hit(url)",
             [f"delete from moz_historyvisits where place_id in {ids}",
@@ -119,7 +190,8 @@ def firefox():
              "delete from moz_pages_w_icons where hit(page_url)"])
         run(prof + "permissions.sqlite", "site permissions", "select count(*) from moz_perms where hit(origin)",
             ["delete from moz_perms where hit(origin)"])
-        rm_dirs([p for p in glob.glob(prof + "storage/default/*") if RX.search(os.path.basename(p))], "site storage")
+        rm_paths([p for p in glob.glob(prof + "storage/default/*") if firefox_origin_hit(os.path.basename(p))],
+                 "site storage")
         lj = prof + "logins.json"
         if os.path.exists(lj):
             data = json.load(open(lj))
@@ -129,7 +201,9 @@ def firefox():
             if DO and n:
                 backup(lj)
                 data["logins"] = keep
-                json.dump(data, open(lj, "w"))
+                write_atomic(lj, json.dumps(data).encode())
+        rm_paths([p for p in glob.glob(L + f"/Caches/Firefox/Profiles/{name}/cache2/entries/*")
+                  if firefox_cache_hit(p)], "cached pages")
 
 
 def binarycookies(path):
@@ -167,15 +241,19 @@ def binarycookies(path):
     out = (b"cook" + struct.pack(">I", len(pages)) + b"".join(struct.pack(">I", len(p)) for p in pages)
            + b"".join(pages) + struct.pack(">I", checksum) + tail)
     backup(path)
-    open(path, "wb").write(out)
+    write_atomic(path, out)
     return removed
 
 
 def safari():
     print("Safari")
+    now = time.time() - 978307200  # Safari stores time as seconds since 2001-01-01
+    # Tombstones tell iCloud to delete these pages on your other devices too (as Safari's own delete does).
     run(L + "/Safari/History.db", "history", "select count(*) from history_items where hit(url)",
-        ["delete from history_visits where history_item in (select id from history_items where hit(url))",
-         "delete from history_tombstones where hit(url)",
+        ["insert into history_tombstones (start_time, end_time, url, generation) "
+         f"select -63114076800.0, {now}, url, (select coalesce(max(generation), 0) + 1 from history_tombstones) "
+         "from history_items where hit(url)",
+         "delete from history_visits where history_item in (select id from history_items where hit(url))",
          "delete from history_items where hit(url)"])
     ck = L + "/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies"
     if os.path.exists(ck):
@@ -186,39 +264,36 @@ def safari():
     run(L + "/Containers/com.apple.Safari/Data/Library/WebKit/WebsiteData/ResourceLoadStatistics/observations.db",
         "tracking records", "select count(*) from ObservedDomains where hhit(registrableDomain)",
         ["PRAGMA foreign_keys=ON", "delete from ObservedDomains where hhit(registrableDomain)"])
-    # Each site's storage folder holds an "origin" file naming the site.
     wd = L + "/Containers/com.apple.Safari/Data/Library/WebKit/WebsiteData/Default"
-    hits = set()
-    for f in glob.glob(wd + "/*/*/origin"):
-        try:
-            if RX.search(open(f, "rb").read().decode("latin-1")):
-                hits.add(os.path.dirname(f))
-        except OSError:
-            pass
-    rm_dirs(sorted(hits), "site storage")
+    rm_paths(sorted({os.path.dirname(f) for f in glob.glob(wd + "/*/*/origin") if safari_origin_hit(f)}),
+             "site storage")
 
 
 def self_check():
     assert url_hit("https://chatgpt.com/c/1") and url_hit("https://cdn.oaistatic.com/x")
     assert not url_hit("https://notchatgpt.com/") and not url_hit("https://google.com/?q=chatgpt.com")
-    assert host_hit(".openai.com") and not host_hit("openai.com.evil.net")
+    assert host_hit(".openai.com") and not host_hit("openai.com.evil.net") and not host_hit("wechat.com")
+    assert chrome_origin_hit("https_chatgpt.com_0.indexeddb.leveldb")
+    assert not chrome_origin_hit("https_wechat.com_0.indexeddb.leveldb")
+    assert firefox_origin_hit("https+++chatgpt.com^userContextId=1") and firefox_origin_hit("https+++auth.openai.com")
+    assert not firefox_origin_hit("https+++www.livechat.com")
+    assert any_url_hit("1/0/_dk_https://chatgpt.com https://chatgpt.com https://cdn.example.com/a.js")
+    assert not any_url_hit("1/0/_dk_https://news.com https://news.com https://news.com/openai.com-story")
 
 
 self_check()
 ONLY_SAFARI = "--safari" in sys.argv
-APPS = {"Google Chrome": "Google Chrome", "Firefox": "firefox", "Safari": "Safari"}
-if ONLY_SAFARI:
-    APPS = {"Safari": "Safari"}
+APPS = {"Safari": "Safari"} if ONLY_SAFARI else {"Google Chrome": "Google Chrome", "Firefox": "firefox", "Safari": "Safari"}
 if DO:
-    for app in APPS:
-        subprocess.run(["osascript", "-e", f'quit app "{app}"'], capture_output=True)
+    for app, proc in APPS.items():
+        if subprocess.run(["pgrep", "-x", "-q", proc]).returncode == 0:  # only ask running apps to quit
+            subprocess.run(["osascript", "-e", f'quit app "{app}"'], capture_output=True)
     for _ in range(20):
         if subprocess.run(["pgrep", "-x", "-q", "|".join(APPS.values())]).returncode:
             break
         time.sleep(1)
     else:
         sys.exit("A browser is still running; quit it and rerun.")
-    print(f"Backups: {BACKUP}")
 if not ONLY_SAFARI:
     chrome(); firefox()
 safari()
