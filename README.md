@@ -11,7 +11,7 @@ Dragging ChatGPT to the Trash leaves gigabytes behind: chat history, memory, cac
 Open **Terminal** (press `⌘ Space`, type `Terminal`, press Return) and paste:
 
 ```bash
-curl -fsSL https://github.com/ebolotin6/chatgpt-uninstaller/archive/refs/heads/main.tar.gz | tar xz && cd chatgpt-uninstaller-main && ./remove-chatgpt.sh
+curl -fsSL https://github.com/ebolotin6/chatgpt-uninstaller/archive/refs/heads/master.tar.gz | tar xz && cd chatgpt-uninstaller-master && ./remove-chatgpt.sh
 ```
 
 That downloads the tool and shows a **preview** of what it found. Nothing is changed yet.
@@ -71,7 +71,7 @@ Without this, everything else is still removed and the tool tells you what it co
 It installs nothing. Just delete the folder:
 
 ```bash
-cd .. && rm -rf chatgpt-uninstaller-main
+cd .. && rm -rf chatgpt-uninstaller-master
 ```
 
 ## License
